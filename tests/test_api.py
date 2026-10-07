@@ -372,3 +372,140 @@ def test_infeasible_solve_is_rejected_and_not_persisted(monkeypatch):
     listing = client.get(
         f"/api/projects/{pid}/documents/d/consensuses").json()
     assert listing == []
+
+
+def test_document_list_only_current_project_and_grouped_revisions():
+    """回归：同 doc_id 两版导入后文档列表 500（SQL 未按 project_id 过滤且
+    参数错位）。修复后只返回当前项目，且同一 doc_id 聚合成一条、含各修订。"""
+    p1 = client.post("/api/projects", json={"name": "rev-list-a"}).json()["id"]
+    p2 = client.post("/api/projects", json={"name": "rev-list-b"}).json()["id"]
+
+    client.post(f"/api/projects/{p1}/documents", json={
+        "doc_id": "d", "content": "甲", "token_bounds": [[0, 1]]})
+    client.post(f"/api/projects/{p1}/documents", json={
+        "doc_id": "d", "content": "乙甲", "token_bounds": [[0, 1], [1, 2]]})
+    client.post(f"/api/projects/{p2}/documents", json={
+        "doc_id": "d", "content": "丙", "token_bounds": [[0, 1]]})
+
+    docs = client.get(f"/api/projects/{p1}/documents")
+    assert docs.status_code == 200, docs.text
+    body = docs.json()
+    assert [d["doc_id"] for d in body] == ["d"]           # 两版不重复出现
+    assert body[0]["revision"] == 2                        # 最新修订号
+    assert [r["revision"] for r in body[0]["revisions"]] == [1, 2]
+    assert [r["char_count"] for r in body[0]["revisions"]] == [1, 2]
+
+    other = client.get(f"/api/projects/{p2}/documents").json()
+    assert [d["doc_id"] for d in other] == ["d"]
+    assert other[0]["revision"] == 1
+
+
+def test_revision_isolation_text_annotations_consensus_snapshots():
+    """开头插字两版：旧版显示旧文本/词元/现存标注；新版坐标独立；
+    历史版只读；无修订参数默认最新版；缺失版本明确 404；
+    旧共识与旧报告永远按保存时的输入快照解释旧坐标。"""
+    pid = client.post("/api/projects", json={"name": "rev-iso"}).json()["id"]
+    bounds1 = [[0, 2], [2, 3], [3, 4]]
+    r = client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "d", "content": "张伟说话", "token_bounds": bounds1})
+    assert r.status_code == 201
+    lab = client.post(f"/api/projects/{pid}/labels",
+                      json={"name": "PER", "color": "#2563eb"}).json()["id"]
+    u1 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "甲", "weight": 8}).json()["id"]
+    u2 = client.post(f"/api/projects/{pid}/annotators",
+                     json={"name": "乙", "weight": 3}).json()["id"]
+    for u in (u1, u2):
+        assert client.post(f"/api/projects/{pid}/documents/d/annotations", json={
+            "annotator_id": u, "label_id": lab, "start": 0, "end": 2
+        }).status_code == 201
+
+    con1 = client.post(f"/api/projects/{pid}/documents/d/consensus", json={}).json()
+    assert con1["revision"] == 1
+    assert con1["snapshot"]["content"] == "张伟说话"
+    assert con1["snapshot"]["token_bounds"] == bounds1
+    rep1 = client.post(
+        f"/api/projects/{pid}/consensuses/{con1['id']}/report", json={}).json()
+
+    # 新版在开头插入 3 个字：旧坐标 [0,2)（张伟）在新版里变成 [3,5)
+    new_text = "记者：张伟说话"
+    bounds2 = [[i, i + 1] for i in range(7)]
+    assert client.post(f"/api/projects/{pid}/documents", json={
+        "doc_id": "d", "content": new_text, "token_bounds": bounds2
+    }).json()["revision"] == 2
+
+    # --- 文档接口：无参最新版；revision=1 旧文本/旧词元；缺失明确 404 ---
+    assert client.get(f"/api/projects/{pid}/documents/d").json()["content"] == new_text
+    old_doc = client.get(f"/api/projects/{pid}/documents/d?revision=1").json()
+    assert old_doc["content"] == "张伟说话"
+    assert old_doc["token_bounds"] == bounds1
+    assert old_doc["latest_revision"] == 2
+    assert client.get(f"/api/projects/{pid}/documents/d?revision=99").status_code == 404
+    assert client.get(f"/api/projects/{pid}/documents/missing").status_code == 404
+
+    # --- 标注按修订隔离，下拉不再共用一组值 ---
+    a1 = client.get(
+        f"/api/projects/{pid}/documents/d/annotations?revision=1").json()
+    assert a1["read_only"] is True and a1["revision"] == 1
+    assert {(a["start"], a["end"]) for a in a1["annotations"]} == {(0, 2)}
+    a2 = client.get(f"/api/projects/{pid}/documents/d/annotations").json()
+    assert a2["read_only"] is False and a2["annotations"] == []
+    assert client.get(
+        f"/api/projects/{pid}/documents/d/annotations?revision=99").status_code == 404
+
+    # --- 历史版只读：提交/批量/删除旧标注均被 409 拒绝，旧坐标不到最新版 ---
+    assert client.post(f"/api/projects/{pid}/documents/d/annotations?revision=1",
+                       json={"annotator_id": u1, "label_id": lab,
+                             "start": 0, "end": 2}).status_code == 409
+    assert client.post(
+        f"/api/projects/{pid}/documents/d/annotations/batch?revision=1",
+        json={"annotations": [{"annotator_id": u1, "label_id": lab,
+                               "start": 0, "end": 2}]}).status_code == 409
+    old_ann_id = a1["annotations"][0]["id"]
+    assert client.delete(
+        f"/api/projects/{pid}/annotations/{old_ann_id}").status_code == 409
+
+    # 新版标注落在新坐标 [3,5)，与旧版互不影响
+    for u in (u1, u2):
+        assert client.post(f"/api/projects/{pid}/documents/d/annotations", json={
+            "annotator_id": u, "label_id": lab, "start": 3, "end": 5
+        }).status_code == 201
+    a2 = client.get(f"/api/projects/{pid}/documents/d/annotations").json()
+    assert {(a["start"], a["end"]) for a in a2["annotations"]} == {(3, 5)}
+    a1 = client.get(
+        f"/api/projects/{pid}/documents/d/annotations?revision=1").json()
+    assert {(a["start"], a["end"]) for a in a1["annotations"]} == {(0, 2)}
+
+    # --- 无参求解默认最新版；快照保存新输入，新共识坐标 3..5 ---
+    con2 = client.post(f"/api/projects/{pid}/documents/d/consensus", json={}).json()
+    assert con2["revision"] == 2
+    assert con2["snapshot"]["content"] == new_text
+    assert {(a["start"], a["end"]) for a in con2["snapshot"]["annotations"]} == {(3, 5)}
+    adopted2 = {(i["start"], i["end"]) for i in con2["items"] if i["adopted"]}
+    assert adopted2 == {(3, 5)}
+
+    # 显式旧版求解：不允许借「无参」静默落到最新版；带 revision 才按旧版
+    assert client.post(
+        f"/api/projects/{pid}/documents/d/consensus?revision=99", json={}
+    ).status_code == 404
+    con1b = client.post(
+        f"/api/projects/{pid}/documents/d/consensus?revision=1", json={}).json()
+    assert con1b["revision"] == 1
+    assert con1b["snapshot"]["content"] == "张伟说话"
+    assert {(i["start"], i["end"]) for i in con1b["items"] if i["adopted"]} == {(0, 2)}
+
+    # --- 旧共识/覆盖/报告仍按各自快照解释旧坐标，不被新版重解释 ---
+    got = client.get(f"/api/projects/{pid}/consensuses/{con1['id']}").json()
+    assert got["snapshot"]["content"] == "张伟说话"
+    assert {(i["start"], i["end"]) for i in got["items"] if i["adopted"]} == {(0, 2)}
+    ov = client.post(
+        f"/api/projects/{pid}/consensuses/{con1['id']}/override", json={
+            "action": "deselect", "start": 0, "end": 2, "label_id": lab,
+            "reason": "旧快照上的覆盖",
+        }).json()
+    assert ov["snapshot"]["content"] == "张伟说话"
+    assert ov["snapshot"]["revision"] == 1
+    old_report = client.get(
+        f"/api/projects/{pid}/reports/{rep1['report_version']}").json()
+    assert old_report["input_snapshot"]["content"] == "张伟说话"
+    assert old_report["input_snapshot"]["revision"] == 1

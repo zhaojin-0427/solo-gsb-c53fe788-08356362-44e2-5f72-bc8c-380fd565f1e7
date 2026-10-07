@@ -75,6 +75,29 @@ def latest_revision(conn, project_id: int, doc_id: str):
     return r
 
 
+def get_revision(conn, project_id: int, doc_id: str, revision: int):
+    d = conn.execute(
+        "SELECT * FROM document_revisions WHERE project_id=? AND doc_id=? AND revision=?",
+        (project_id, doc_id, revision),
+    ).fetchone()
+    if d is None:
+        exists = conn.execute(
+            "SELECT 1 FROM document_revisions WHERE project_id=? AND doc_id=? LIMIT 1",
+            (project_id, doc_id),
+        ).fetchone()
+        if exists is None:
+            raise HTTPException(404, f"文档 {doc_id} 尚未导入")
+        raise HTTPException(404, f"文档 {doc_id} 的 revision {revision} 不存在")
+    return d
+
+
+def resolve_revision(conn, project_id: int, doc_id: str, revision: int | None):
+    """不带 revision 参数时默认最新版；显式指定缺失版本时明确 404。"""
+    if revision is None:
+        return latest_revision(conn, project_id, doc_id)
+    return get_revision(conn, project_id, doc_id, revision)
+
+
 def labels_map(conn, project_id: int) -> dict[int, dict]:
     return {
         r["id"]: row(r)
@@ -306,6 +329,7 @@ def serialize_consensus(conn, consensus_id: int) -> dict[str, Any]:
     return {
         **row(c),
         "params": json.loads(c["params_json"]),
+        "snapshot": json.loads(c["snapshot_json"]),
         "items": items,
         "overrides": overrides,
         "reports": reports,
@@ -368,38 +392,44 @@ def import_document(project_id: int, body: DocumentIn):
 
 @app.get("/api/projects/{project_id}/documents")
 def list_documents(project_id: int):
+    """只返回当前项目的文档；同一 doc_id 的多个修订聚合为一条。"""
     with db.connect() as conn:
         get_project(conn, project_id)
-        return [
-            {
-                "doc_id": r["doc_id"],
+        docs: dict[str, dict] = {}
+        for r in conn.execute(
+            "SELECT doc_id,revision,char_count,created_at FROM document_revisions "
+            "WHERE project_id=? ORDER BY doc_id, revision",
+            (project_id,),
+        ):
+            d = docs.get(r["doc_id"])
+            if d is None:
+                d = {
+                    "doc_id": r["doc_id"],
+                    "revision": r["revision"],
+                    "char_count": r["char_count"],
+                    "created_at": r["created_at"],
+                    "revisions": [],
+                }
+                docs[r["doc_id"]] = d
+            d["revisions"].append({
                 "revision": r["revision"],
                 "char_count": r["char_count"],
                 "created_at": r["created_at"],
-            }
-            for r in conn.execute(
-                "SELECT doc_id,revision,char_count,created_at FROM document_revisions "
-                "ORDER BY doc_id, revision",
-                (project_id,),
-            )
-        ]
+            })
+            d["revision"] = r["revision"]  # 末项即最新修订（按 revision 升序）
+            d["char_count"] = r["char_count"]
+            d["created_at"] = r["created_at"]
+        return list(docs.values())
 
 
 @app.get("/api/projects/{project_id}/documents/{doc_id}")
 def get_document(project_id: int, doc_id: str, revision: int | None = None):
     with db.connect() as conn:
         get_project(conn, project_id)
-        if revision is None:
-            d = latest_revision(conn, project_id, doc_id)
-        else:
-            d = conn.execute(
-                "SELECT * FROM document_revisions WHERE project_id=? AND doc_id=? AND revision=?",
-                (project_id, doc_id, revision),
-            ).fetchone()
-            if d is None:
-                raise HTTPException(404, "该文档版本不存在")
+        d = resolve_revision(conn, project_id, doc_id, revision)
         return {
             "doc_id": d["doc_id"], "revision": d["revision"],
+            "latest_revision": latest_revision(conn, project_id, doc_id)["revision"],
             "content": d["content"],
             "token_bounds": json.loads(d["token_bounds"]),
             "char_count": d["char_count"],
@@ -567,10 +597,18 @@ def _prepare_annotation(conn, project_id, doc, body: AnnotationIn) -> None:
 
 
 @app.post("/api/projects/{project_id}/documents/{doc_id}/annotations", status_code=201)
-def add_annotation(project_id: int, doc_id: str, body: AnnotationIn):
+def add_annotation(project_id: int, doc_id: str, body: AnnotationIn,
+                   revision: int | None = None):
     with db.connect() as conn:
         get_project(conn, project_id)
-        doc = latest_revision(conn, project_id, doc_id)
+        doc = resolve_revision(conn, project_id, doc_id, revision)
+        latest = latest_revision(conn, project_id, doc_id)
+        if doc["revision"] != latest["revision"]:
+            raise HTTPException(
+                409,
+                f"revision {doc['revision']} 是历史版本（只读）；请切换到最新版 "
+                f"revision {latest['revision']} 后再提交标注",
+            )
         _prepare_annotation(conn, project_id, doc, body)
         cur = conn.execute(
             "INSERT INTO annotations (project_id,doc_id,revision,annotator_id,"
@@ -584,10 +622,18 @@ def add_annotation(project_id: int, doc_id: str, body: AnnotationIn):
 
 
 @app.post("/api/projects/{project_id}/documents/{doc_id}/annotations/batch", status_code=201)
-def add_annotation_batch(project_id: int, doc_id: str, body: AnnotationBatchIn):
+def add_annotation_batch(project_id: int, doc_id: str, body: AnnotationBatchIn,
+                         revision: int | None = None):
     with db.connect() as conn:
         get_project(conn, project_id)
-        doc = latest_revision(conn, project_id, doc_id)
+        doc = resolve_revision(conn, project_id, doc_id, revision)
+        latest = latest_revision(conn, project_id, doc_id)
+        if doc["revision"] != latest["revision"]:
+            raise HTTPException(
+                409,
+                f"revision {doc['revision']} 是历史版本（只读）；请切换到最新版 "
+                f"revision {latest['revision']} 后再提交标注",
+            )
         created = []
         for item in body.annotations:
             _prepare_annotation(conn, project_id, doc, item)
@@ -603,10 +649,11 @@ def add_annotation_batch(project_id: int, doc_id: str, body: AnnotationBatchIn):
 
 
 @app.get("/api/projects/{project_id}/documents/{doc_id}/annotations")
-def list_annotations(project_id: int, doc_id: str):
+def list_annotations(project_id: int, doc_id: str, revision: int | None = None):
+    """返回绑定到指定修订的现存标注；不带 revision 默认最新版。"""
     with db.connect() as conn:
         get_project(conn, project_id)
-        doc = latest_revision(conn, project_id, doc_id)
+        doc = resolve_revision(conn, project_id, doc_id, revision)
         rows = [
             row(r)
             for r in conn.execute(
@@ -618,13 +665,33 @@ def list_annotations(project_id: int, doc_id: str):
                 (project_id, doc_id, doc["revision"]),
             )
         ]
-        return {"revision": doc["revision"], "annotations": rows}
+        latest = latest_revision(conn, project_id, doc_id)
+        return {
+            "doc_id": doc_id,
+            "revision": doc["revision"],
+            "latest_revision": latest["revision"],
+            "read_only": doc["revision"] != latest["revision"],
+            "annotations": rows,
+        }
 
 
 @app.delete("/api/projects/{project_id}/annotations/{annotation_id}")
 def delete_annotation(project_id: int, annotation_id: int):
     with db.connect() as conn:
         get_project(conn, project_id)
+        a = conn.execute(
+            "SELECT doc_id,revision FROM annotations WHERE id=? AND project_id=?",
+            (annotation_id, project_id),
+        ).fetchone()
+        if a is None:
+            raise HTTPException(404, "标注不存在")
+        latest = latest_revision(conn, project_id, a["doc_id"])
+        if a["revision"] != latest["revision"]:
+            raise HTTPException(
+                409,
+                f"该标注绑定的 revision {a['revision']} 是历史版本（只读），"
+                "历史标注不可删除",
+            )
         cur = conn.execute(
             "DELETE FROM annotations WHERE id=? AND project_id=?",
             (annotation_id, project_id),
@@ -638,10 +705,10 @@ def delete_annotation(project_id: int, annotation_id: int):
 # 共识求解
 # ---------------------------------------------------------------------------
 @app.post("/api/projects/{project_id}/documents/{doc_id}/consensus", status_code=201)
-def solve(project_id: int, doc_id: str):
+def solve(project_id: int, doc_id: str, revision: int | None = None):
     with db.connect() as conn:
         get_project(conn, project_id)
-        doc = latest_revision(conn, project_id, doc_id)
+        doc = resolve_revision(conn, project_id, doc_id, revision)
         snapshot = build_snapshot(conn, project_id, doc)
 
         used = {a["annotator_id"] for a in snapshot["annotations"]}

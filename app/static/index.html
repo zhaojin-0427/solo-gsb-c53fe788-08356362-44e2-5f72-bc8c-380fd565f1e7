@@ -25,7 +25,13 @@
   <h2><span class="step">1</span> 导入 UTF-8 文档与词元边界</h2>
   <div class="row">
     <input id="docId" placeholder="文档 ID，例如 doc-001" class="grow">
-    <select id="docSelect" title="已导入文档（选择查看历史版本）"></select>
+    <select id="docSelect" title="已导入文档"></select>
+    <select id="revSelect" title="该文档的修订版本（选择历史版本即进入只读历史视图）"></select>
+  </div>
+  <div id="readonlyBanner" class="notice hidden">
+    🔒 正在查看历史版本 <b id="readonlyRev"></b>（只读）：文本、词元与该修订的现存标注按历史数据呈现。
+    历史版本不能提交/删除标注，也不能在此求新共识。
+    <button id="backToLatestBtn" class="btn small">切回最新版继续编辑</button>
   </div>
   <textarea id="docContent" rows="5" placeholder="粘贴 UTF-8 纯文本文档（支持换行、制表符）…"></textarea>
   <div class="row">
@@ -105,9 +111,13 @@
   <h2><span class="step">5</span> 确定性共识裁决（OR-Tools CP-SAT）</h2>
   <div class="row">
     <button class="btn primary big" id="solveBtn">▶ 求最大得分共识</button>
-    <select id="consensusHistory" title="历史共识"></select>
+    <select id="consensusHistory" title="该文档各修订的历史共识"></select>
     <span id="solveMeta" class="hint"></span>
   </div>
+  <p id="solveHint" class="hint hidden">
+    当前为历史修订只读视图，不能求解；可在右侧下拉选择该修订已有的共识（按其输入快照渲染），
+    或切回最新版后求解新共识。
+  </p>
   <details id="solveParams" class="hidden">
     <summary>实际算法参数与版本</summary>
     <pre class="json" id="solveParamsJson"></pre>

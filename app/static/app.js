@@ -22,7 +22,9 @@ const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
 const state = {
   projectId: null,
   docId: null,
-  revision: null,
+  revision: null,        // 当前查看的修订（可为历史版）
+  latestRevision: null,  // 该文档最新修订号
+  docList: [],
   content: "",
   tokenBounds: [],
   labels: [],
@@ -32,6 +34,10 @@ const state = {
   annotations: [],
   consensus: null,
 };
+
+const readOnly = () =>
+  state.docId != null && state.latestRevision != null &&
+  state.revision !== state.latestRevision;
 
 // ---------------------------------------------------------------------------
 // 通用
@@ -142,19 +148,25 @@ $("#importDocBtn").addEventListener("click", async () => {
     });
     toast(r.notice || `文档已导入（revision ${r.revision}）`);
     await refreshDocuments(doc_id);
+    await updateRevisionOptions(r.revision);
   } catch (e) { toast(e.message, true); }
 });
 
 async function refreshDocuments(selectDocId) {
   const docs = await api(`/api/projects/${state.projectId}/documents`);
+  state.docList = docs;
   const sel = $("#docSelect");
   sel.innerHTML = docs.map((d) =>
-    `<option value="${esc(d.doc_id)}">${esc(d.doc_id)} · v${d.revision} (${d.char_count}字)</option>`
+    `<option value="${esc(d.doc_id)}">${esc(d.doc_id)} · 最新 v${d.revision} (${d.char_count}字)</option>`
   ).join("");
-  state.docId = selectDocId || sel.value || null;
+  if (selectDocId && docs.some((d) => d.doc_id === selectDocId)) {
+    state.docId = selectDocId;
+  } else if (!state.docId || !docs.some((d) => d.docId === state.docId)) {
+    state.docId = sel.value || null;
+  }
   sel.value = state.docId || "";
-  if (state.docId) await loadDocument();
-  else {
+  await updateRevisionOptions();
+  if (!state.docId) {
     state.content = "";
     state.tokenBounds = [];
     state.annotations = [];
@@ -162,24 +174,90 @@ async function refreshDocuments(selectDocId) {
   }
 }
 
+// 根据所选文档刷新「修订版本」下拉；preferRev 缺省时选最新版
+async function updateRevisionOptions(preferRev) {
+  const sel = $("#revSelect");
+  const doc = state.docList.find((d) => d.doc_id === state.docId);
+  if (!doc) {
+    sel.innerHTML = "";
+    state.revision = null;
+    state.latestRevision = null;
+    await loadDocumentView();
+    return;
+  }
+  sel.innerHTML = doc.revisions.map((r) =>
+    `<option value="${r.revision}">revision ${r.revision}` +
+    (r.revision === doc.revision ? "（最新）" : "（历史只读）") +
+    ` · ${r.char_count}字</option>`
+  ).join("");
+  const wanted = preferRev != null && doc.revisions.some((r) => r.revision === preferRev)
+    ? preferRev
+    : doc.revision;
+  sel.value = String(wanted);
+  state.revision = wanted;
+  state.latestRevision = doc.revision;
+  await loadDocumentView();
+}
+
 $("#docSelect").addEventListener("change", async (e) => {
   state.docId = e.target.value || null;
-  await loadDocument();
+  await updateRevisionOptions();
 });
 
-async function loadDocument() {
+$("#revSelect").addEventListener("change", async () => {
+  const rev = Number($("#revSelect").value);
+  if (!rev) return;
+  state.revision = rev;
+  await loadDocumentView();
+});
+
+$("#backToLatestBtn").addEventListener("click", async () => {
+  await updateRevisionOptions(state.latestRevision);
+  toast("已切回最新版，可继续提交标注与求共识");
+});
+
+async function loadDocumentView() {
+  if (!state.docId || !state.revision) {
+    state.content = "";
+    state.tokenBounds = [];
+    state.annotations = [];
+    renderAnnotations();
+    applyReadOnlyUi();
+    return;
+  }
   const d = await api(
-    `/api/projects/${state.projectId}/documents/${encodeURIComponent(state.docId)}`
+    `/api/projects/${state.projectId}/documents/${encodeURIComponent(state.docId)}` +
+    `?revision=${state.revision}`
   );
   state.revision = d.revision;
+  state.latestRevision = d.latest_revision;
   state.content = d.content;
   state.tokenBounds = d.token_bounds;
   $("#docMeta").textContent =
-    `当前版本 revision=${d.revision}，${d.char_count} 个字符，${d.token_bounds.length} 个词元`;
+    `当前版本 revision=${d.revision}（最新 revision=${d.latest_revision}），` +
+    `${d.char_count} 个字符，${d.token_bounds.length} 个词元` +
+    (readOnly() ? " —— 历史版本只读" : "");
   $("#docPreview").textContent =
     d.content.length > 600 ? d.content.slice(0, 600) + " …" : d.content;
   renderSelectableText();
   await refreshAnnotations();
+  state.consensus = null;
+  renderConsensus();
+  applyReadOnlyUi();
+  await refreshConsensusHistory();
+}
+
+// 历史版本：禁用会把（旧）坐标写入或作用到最新版的入口；
+// 标签/标注者是项目级实体，覆盖/报告基于所选共识快照，均不触碰最新版。
+function applyReadOnlyUi() {
+  const ro = readOnly();
+  $("#readonlyBanner").classList.toggle("hidden", !ro);
+  if (ro) $("#readonlyRev").textContent = `${state.docId} v${state.revision}`;
+  for (const id of ["addAnnBtn", "useSelectionBtn", "solveBtn"]) {
+    $(`#${id}`).disabled = ro;
+  }
+  const solveHint = $("#solveHint");
+  if (solveHint) solveHint.classList.toggle("hidden", !ro);
 }
 
 function renderSelectableText() {
@@ -330,6 +408,7 @@ async function refreshAnnotators() {
 // 4. 标注
 // ---------------------------------------------------------------------------
 $("#addAnnBtn").addEventListener("click", async () => {
+  if (readOnly()) return toast("历史版本只读：请切回最新版后再提交标注", true);
   const body = {
     annotator_id: Number($("#annAnnotator").value),
     label_id: Number($("#annLabel").value),
@@ -353,13 +432,15 @@ async function refreshAnnotations() {
     return;
   }
   const data = await api(
-    `/api/projects/${state.projectId}/documents/${encodeURIComponent(state.docId)}/annotations`
+    `/api/projects/${state.projectId}/documents/${encodeURIComponent(state.docId)}` +
+    `/annotations?revision=${state.revision}`
   );
   state.annotations = data.annotations;
   renderAnnotations();
 }
 
 function renderAnnotations() {
+  const ro = readOnly();
   const tbody = $("#annotationTable").querySelector("tbody");
   tbody.innerHTML = state.annotations.map((a) => `
     <tr>
@@ -368,7 +449,8 @@ function renderAnnotations() {
       <td><span class="tag-dot" style="background:${a.color}"></span>${esc(a.label_name)}</td>
       <td>[${a.start},${a.end})</td>
       <td>${esc((state.content || "").slice(a.start, a.end))}</td>
-      <td><button class="del" data-id="${a.id}">删除</button></td>
+      <td>${ro ? '<span class="hint">历史只读</span>'
+        : `<button class="del" data-id="${a.id}">删除</button>`}</td>
     </tr>`).join("");
   tbody.querySelectorAll(".del").forEach((btn) =>
     btn.addEventListener("click", async () => {
@@ -377,7 +459,7 @@ function renderAnnotations() {
       await refreshAnnotations();
     }));
 
-  // 在原文上叠加所有输入标注
+  // 当前修订的文本 + 绑定当前修订的标注（历史坐标不与新版文字串版）
   renderHighlighted($("#selectableText"), state.content, state.annotations.map((a) => ({
     start: a.start, end: a.end, label: a.label_name, color: a.color,
   })));
@@ -387,6 +469,9 @@ function renderAnnotations() {
 // 5. 共识 / 覆盖 / 报告
 // ---------------------------------------------------------------------------
 $("#solveBtn").addEventListener("click", async () => {
+  if (readOnly()) {
+    return toast("历史版本只读：请先切回最新版再求共识", true);
+  }
   try {
     const c = await api(
       `/api/projects/${state.projectId}/documents/${encodeURIComponent(state.docId)}/consensus`,
@@ -399,20 +484,37 @@ $("#solveBtn").addEventListener("click", async () => {
 });
 
 async function refreshConsensusHistory(pickId) {
+  const sel = $("#consensusHistory");
+  if (!state.docId) { sel.innerHTML = ""; return; }
   const list = await api(
     `/api/projects/${state.projectId}/documents/${encodeURIComponent(state.docId)}/consensuses`);
-  const sel = $("#consensusHistory");
-  sel.innerHTML = list.map((c) =>
-    `<option value="${c.id}">#${c.id} · v${c.revision} · ${c.solver_status} · 总分${c.raw_total_score} · ${c.created_at}</option>`
-  ).join("");
-  if (pickId) sel.value = String(pickId);
+  sel.innerHTML =
+    `<option value="">— 选择历史共识（只读，按各自快照渲染）—</option>` +
+    list.map((c) =>
+      `<option value="${c.id}">#${c.id} · v${c.revision} · ${c.solver_status} · 总分${c.raw_total_score} · ${c.created_at}</option>`
+    ).join("");
+  sel.value = pickId && list.some((c) => c.id === pickId) ? String(pickId) : "";
 }
 
 $("#consensusHistory").addEventListener("change", async (e) => {
   const id = Number(e.target.value);
-  if (!id) return;
-  state.consensus = await api(`/api/projects/${state.projectId}/consensuses/${id}`);
-  renderConsensus();
+  if (!id) {
+    state.consensus = null;
+    renderConsensus();
+    return;
+  }
+  try {
+    const c = await api(`/api/projects/${state.projectId}/consensuses/${id}`);
+    // 共识坐标属于其输入快照：当前修订与快照不同时，先切换到快照修订再渲染，
+    // 整个过程只读，绝不重新求解最新版。
+    if (state.revision !== c.revision) {
+      await updateRevisionOptions(c.revision); // 内部会重载并把下拉重置为占位项
+    }
+    state.consensus = c;
+    await refreshConsensusHistory(c.id);
+    renderConsensus();
+    toast(`已按 #${c.id} 的输入快照（revision ${c.revision}）渲染，未触发任何重新求解`);
+  } catch (err) { toast(err.message, true); }
 });
 
 function supporterLine(s) {
@@ -428,8 +530,19 @@ function renderConsensus() {
     $("#solveParams").classList.add("hidden");
     return;
   }
+  // 文字与高亮一律取自该共识保存时的输入快照，绝不按当前文本解释旧坐标
+  const snap = c.snapshot || {};
+  const cText = snap.content || "";
+  const cColor = (id) =>
+    ((snap.labels || []).find((l) => l.id === id) || {}).color || "#94a3b8";
+  const cLabelName = (id) =>
+    ((snap.labels || []).find((l) => l.id === id) || {}).name || `#${id}`;
+  const snapshotMismatch = state.revision !== c.revision;
+
   $("#solveMeta").textContent =
-    `共识 #${c.id} · 算法 ${c.algorithm_name} v${c.algorithm_version} · ` +
+    `共识 #${c.id} · 快照 revision=${c.revision}` +
+    (snapshotMismatch ? "（与当前修订不同，已单独按快照渲染）" : "") +
+    ` · 算法 ${c.algorithm_name} v${c.algorithm_version} · ` +
     `${c.solver_status} · 总分 ${c.raw_total_score} · ${c.created_at}` +
     (c.solver_status === "OPTIMAL"
       ? ""
@@ -443,15 +556,15 @@ function renderConsensus() {
   const adopted = c.items.filter((i) => i.adopted);
   const rejected = c.items.filter((i) => !i.adopted);
 
-  renderHighlighted($("#adoptedText"), state.content, adopted.map((i) => ({
+  renderHighlighted($("#adoptedText"), cText, adopted.map((i) => ({
     start: i.start, end: i.end, label: i.label_name,
-    color: labelById(i.label_id).color,
+    color: cColor(i.label_id),
   })));
 
   $("#adoptedTable").querySelector("tbody").innerHTML = adopted.map((i) => `
     <tr>
-      <td>[${i.start},${i.end})<br><span class="hint">${esc((state.content || "").slice(i.start, i.end))}</span></td>
-      <td><span class="tag-dot" style="background:${labelById(i.label_id).color}"></span>${esc(i.label_name)}</td>
+      <td>[${i.start},${i.end})<br><span class="hint">${esc(cText.slice(i.start, i.end))}</span></td>
+      <td><span class="tag-dot" style="background:${cColor(i.label_id)}"></span>${esc(i.label_name)}</td>
       <td>${i.raw_score}</td>
       <td>${i.supporters.map(supporterLine).join("")}</td>
       <td>${i.forced ? '<span class="badge forced">裁决覆盖</span>' : '<span class="badge">算法</span>'}</td>
@@ -460,8 +573,8 @@ function renderConsensus() {
 
   $("#rejectedTable").querySelector("tbody").innerHTML = rejected.map((i) => `
     <tr>
-      <td>[${i.start},${i.end})<br><span class="hint">${esc((state.content || "").slice(i.start, i.end))}</span></td>
-      <td><span class="tag-dot" style="background:${labelById(i.label_id).color}"></span>${esc(i.label_name)}</td>
+      <td>[${i.start},${i.end})<br><span class="hint">${esc(cText.slice(i.start, i.end))}</span></td>
+      <td><span class="tag-dot" style="background:${cColor(i.label_id)}"></span>${esc(i.label_name)}</td>
       <td>${i.raw_score}</td>
       <td>${i.supporters.map(supporterLine).join("")}</td>
       <td>
@@ -482,10 +595,14 @@ function renderConsensus() {
       window.scrollTo({ top: $("#overrideBtn").offsetTop - 80, behavior: "smooth" });
     }));
 
+  // 覆盖表单的标签下拉使用快照内标签，保证覆盖校验的是快照坐标
+  $("#ovLabel").innerHTML = (snap.labels || []).map((l) =>
+    `<option value="${l.id}">${esc(l.name)}</option>`).join("");
+
   $("#overrideList").innerHTML = c.overrides.map((o) => {
-    const l = labelById(o.label_id);
+    const color = cColor(o.label_id);
     return `<li>${o.action === "select" ? "✅强制采纳" : "⛔强制否决"}
-      [${o.start},${o.end}) <span class="tag-dot" style="background:${l.color}"></span>${esc(l.name)}
+      [${o.start},${o.end}) <span class="tag-dot" style="background:${color}"></span>${esc(cLabelName(o.label_id))}
       —— ${esc(o.reason)}</li>`;
   }).join("");
 }
@@ -625,7 +742,7 @@ $("#loadDemoBtn").addEventListener("click", async () => {
     });
 
     await loadProjects(p.id);
-    await refreshDocuments("demo-doc");
+    // loadProjects 已按最新版载入 demo-doc 视图
     toast("示例已载入：可直接点击「求最大得分共识」查看冲突裁决");
   } catch (e) { toast(e.message, true); }
 });
@@ -639,13 +756,12 @@ async function refreshAll() {
     return;
   }
   await Promise.all([
-    refreshDocuments(),
+    refreshDocuments(),   // 内部 updateRevisionOptions → loadDocumentView 已刷新共识历史
     refreshLabels(),
     refreshAnnotators(),
   ]);
   state.consensus = null;
   renderConsensus();
-  $("#consensusHistory").innerHTML = "";
 }
 
 (async function init() {

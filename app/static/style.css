@@ -82,6 +82,20 @@ input[type=color] { padding: 2px; height: 36px; width: 52px; }
 .btn.ghost { background: transparent; }
 .topbar .btn.ghost { color: #e0e7ff; border-color: rgba(255,255,255,.4); }
 .btn.danger { color: var(--danger); }
+.btn:disabled, .btn[disabled] {
+  opacity: .5; cursor: not-allowed; border-color: var(--line); color: var(--muted);
+}
+.notice {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #f59e0b;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 13px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.notice .btn { margin-left: auto; }
 .hint { color: var(--muted); font-size: 13px; }
 .check { font-size: 13px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
 .hidden { display: none !important; }
