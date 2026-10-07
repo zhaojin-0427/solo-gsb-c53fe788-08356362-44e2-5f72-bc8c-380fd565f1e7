@@ -306,6 +306,9 @@ def serialize_consensus(conn, consensus_id: int) -> dict[str, Any]:
     return {
         **row(c),
         "params": json.loads(c["params_json"]),
+        # 快照随接口返回：查看旧共识时一律按其冻结时的文本/词元/标注渲染，
+        # 不允许用当前最新版文本解释旧坐标（防止「串版」高亮）。
+        "snapshot": json.loads(c["snapshot_json"]),
         "items": items,
         "overrides": overrides,
         "reports": reports,
@@ -368,6 +371,11 @@ def import_document(project_id: int, body: DocumentIn):
 
 @app.get("/api/projects/{project_id}/documents")
 def list_documents(project_id: int):
+    """列出当前项目的全部文档修订（按 doc_id、revision 排序）。
+
+    只返回当前项目的数据：同一 doc_id 的每个修订各占一条，前端据此
+    构建「文档 + 修订」两个下拉，绝不能混入其他项目的同名文档。
+    """
     with db.connect() as conn:
         get_project(conn, project_id)
         return [
@@ -379,7 +387,7 @@ def list_documents(project_id: int):
             }
             for r in conn.execute(
                 "SELECT doc_id,revision,char_count,created_at FROM document_revisions "
-                "ORDER BY doc_id, revision",
+                "WHERE project_id=? ORDER BY doc_id, revision",
                 (project_id,),
             )
         ]
@@ -392,12 +400,25 @@ def get_document(project_id: int, doc_id: str, revision: int | None = None):
         if revision is None:
             d = latest_revision(conn, project_id, doc_id)
         else:
+            # 先确认文档本身存在，再区分「文档缺失」与「该修订缺失」，
+            # 缺失版本必须明确报错，绝不静默回退到最新版（防串版）。
+            exists = conn.execute(
+                "SELECT MAX(revision) AS m FROM document_revisions "
+                "WHERE project_id=? AND doc_id=?",
+                (project_id, doc_id),
+            ).fetchone()["m"]
+            if exists is None:
+                raise HTTPException(404, f"文档 {doc_id} 尚未导入")
             d = conn.execute(
                 "SELECT * FROM document_revisions WHERE project_id=? AND doc_id=? AND revision=?",
                 (project_id, doc_id, revision),
             ).fetchone()
             if d is None:
-                raise HTTPException(404, "该文档版本不存在")
+                raise HTTPException(
+                    404,
+                    f"文档 {doc_id} 的 revision {revision} 不存在"
+                    f"（现有修订：1~{exists}）",
+                )
         return {
             "doc_id": d["doc_id"], "revision": d["revision"],
             "content": d["content"],
@@ -603,10 +624,23 @@ def add_annotation_batch(project_id: int, doc_id: str, body: AnnotationBatchIn):
 
 
 @app.get("/api/projects/{project_id}/documents/{doc_id}/annotations")
-def list_annotations(project_id: int, doc_id: str):
+def list_annotations(project_id: int, doc_id: str, revision: int | None = None):
+    """返回指定修订上的标注；不传 revision 时默认最新修订。
+
+    标注按 (doc_id, revision) 绑定，历史视图必须显式带上自己的修订号，
+    否则会错误地取到最新版文本/标注（即「串版」）。
+    """
     with db.connect() as conn:
         get_project(conn, project_id)
-        doc = latest_revision(conn, project_id, doc_id)
+        if revision is None:
+            doc = latest_revision(conn, project_id, doc_id)
+        else:
+            doc = conn.execute(
+                "SELECT * FROM document_revisions WHERE project_id=? AND doc_id=? AND revision=?",
+                (project_id, doc_id, revision),
+            ).fetchone()
+            if doc is None:
+                raise HTTPException(404, f"文档 {doc_id} 的 revision {revision} 不存在")
         rows = [
             row(r)
             for r in conn.execute(
@@ -618,13 +652,34 @@ def list_annotations(project_id: int, doc_id: str):
                 (project_id, doc_id, doc["revision"]),
             )
         ]
-        return {"revision": doc["revision"], "annotations": rows}
+        return {"doc_id": doc_id, "revision": doc["revision"],
+                "is_latest": doc["revision"] == latest_revision(
+                    conn, project_id, doc_id)["revision"],
+                "annotations": rows}
 
 
 @app.delete("/api/projects/{project_id}/annotations/{annotation_id}")
 def delete_annotation(project_id: int, annotation_id: int):
     with db.connect() as conn:
         get_project(conn, project_id)
+        r = conn.execute(
+            "SELECT doc_id,revision FROM annotations WHERE id=? AND project_id=?",
+            (annotation_id, project_id),
+        ).fetchone()
+        if r is None:
+            raise HTTPException(404, "标注不存在")
+        # 历史修订只读：只能删除最新修订上的标注
+        latest = conn.execute(
+            "SELECT MAX(revision) AS m FROM document_revisions "
+            "WHERE project_id=? AND doc_id=?",
+            (project_id, r["doc_id"]),
+        ).fetchone()["m"]
+        if latest is not None and r["revision"] < latest:
+            raise HTTPException(
+                409,
+                f"revision {r['revision']} 为历史版本（只读），不能删除其标注；"
+                f"请切回最新 revision {latest} 后再编辑",
+            )
         cur = conn.execute(
             "DELETE FROM annotations WHERE id=? AND project_id=?",
             (annotation_id, project_id),

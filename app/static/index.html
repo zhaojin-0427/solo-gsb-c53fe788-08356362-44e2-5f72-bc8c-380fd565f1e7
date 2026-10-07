@@ -25,7 +25,13 @@
   <h2><span class="step">1</span> 导入 UTF-8 文档与词元边界</h2>
   <div class="row">
     <input id="docId" placeholder="文档 ID，例如 doc-001" class="grow">
-    <select id="docSelect" title="已导入文档（选择查看历史版本）"></select>
+    <select id="docSelect" title="已导入文档"></select>
+    <select id="revSelect" title="该文档的历史修订（旧版只读）"></select>
+  </div>
+  <div id="readonlyBanner" class="banner hidden">
+    🔒 正在查看历史修订 <b id="readonlyRev"></b>（只读）：文本、词元与标注均为该修订的存档，
+    不能提交/删除标注或求解；共识高亮按各共识自己的输入快照渲染，不会把旧坐标套到最新版。
+    <button class="btn small" id="backToLatestBtn" type="button">切回最新版继续编辑</button>
   </div>
   <textarea id="docContent" rows="5" placeholder="粘贴 UTF-8 纯文本文档（支持换行、制表符）…"></textarea>
   <div class="row">
@@ -108,6 +114,7 @@
     <select id="consensusHistory" title="历史共识"></select>
     <span id="solveMeta" class="hint"></span>
   </div>
+  <div id="snapshotNote" class="banner hidden"></div>
   <details id="solveParams" class="hidden">
     <summary>实际算法参数与版本</summary>
     <pre class="json" id="solveParamsJson"></pre>

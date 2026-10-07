@@ -7,7 +7,7 @@ from ortools.sat.python import cp_model
 
 _tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 _tmp.close()
-os.environ["ADJ_DB_PATH"] = _tmp.name
+os.environ.setdefault("ADJ_DB_PATH", _tmp.name)
 
 from fastapi.testclient import TestClient  # noqa: E402
 

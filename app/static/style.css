@@ -85,6 +85,21 @@ input[type=color] { padding: 2px; height: 36px; width: 52px; }
 .hint { color: var(--muted); font-size: 13px; }
 .check { font-size: 13px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
 .hidden { display: none !important; }
+.banner {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+  color: #92400e;
+}
+.banner .btn { white-space: nowrap; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
 .doc-preview {
   background: #f8fafc;
   border: 1px dashed var(--line);
